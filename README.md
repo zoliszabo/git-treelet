@@ -13,6 +13,29 @@ Think of it as an enhanced `git subtree` that:
 
 **Use case:** You have a monorepo and want to maintain some subdirectories as independent git repositories that can be developed both in the monorepo and standalone.
 
+## Comparison with git submodules and git subtree
+
+| Feature | git submodules | git subtree | git-treelet |
+|---------|---------------|-------------|-------------|
+| **Integration** | External reference (pointer) | Full copy of history | Full copy of content |
+| **Repository size** | Small (just pointer) | Large (includes history) | Medium (content only) |
+| **Workflow complexity** | High (requires init/update) | Medium | Low |
+| **Bidirectional sync** | Manual | Manual (split required) | Built-in (push/pull/sync) |
+| **Working tree safety** | Requires checkout | Modifies during ops | No modification during ops |
+| **Metadata commits** | N/A | Preserved in history | Automatically filtered |
+| **Author rewriting** | N/A | Manual | Built-in option |
+| **Custom naming** | Path = name | Path = reference | Independent from path |
+| **Clone simplicity** | Requires --recurse | Just clone | Just clone |
+| **Best for** | Independent dependencies | One-time imports | Active bidirectional sync |
+
+**Key differences:**
+
+- **git submodules**: External repositories stay separate (pointer only). Requires explicit initialization and updates. Best when you want to pin specific versions of dependencies.
+
+- **git subtree**: Merges external repository history into your main repository. Good for one-time imports, but bidirectional sync (using `git subtree split`) is complex and preserves all metadata commits.
+
+- **git-treelet**: Designed for active bidirectional development. Automatically filters metadata commits on push, supports author rewriting for privacy, and uses git plumbing to avoid working tree modifications during operations. Best when you want to actively develop code both in the monorepo and as a standalone repository. Particularly useful when working with AI tools / agents on the sub-repository, as they can iterate independently while changes seamlessly sync back to the main project.
+
 ## Installation
 
 1. Place the `git-treelet` script in your `PATH`:
