@@ -1,0 +1,911 @@
+#!/bin/bash
+set -euo pipefail
+
+# git-treelet: Manage external repositories as subdirectories ("treelets")
+
+# Global variables
+COMMAND=""
+VERBOSE=false
+TREELET_NAME=""
+TREELET_PATH=""
+REMOTE_URL=""
+REMOTE_REF=""
+FORCE_AUTHOR_NAME=""
+FORCE_AUTHOR_EMAIL=""
+SQUASH=false
+
+# Logging function
+log() { $VERBOSE && echo "$1" || true; }
+
+#############################################
+# Config Helper Functions
+#############################################
+
+# Get treelet config value
+# Usage: treelet_config_get <name> <key>
+treelet_config_get() {
+    local name="$1"
+    local key="$2"
+    git config --get "treelet.$name.$key" 2>/dev/null || echo ""
+}
+
+# Set treelet config value (idempotent - replaces if exists, adds if not)
+# Usage: treelet_config_set <name> <key> <value>
+treelet_config_set() {
+    local name="$1"
+    local key="$2"
+    local value="$3"
+
+    # Check if key already exists
+    if git config --get "treelet.$name.$key" >/dev/null 2>&1; then
+        # Replace existing value
+        git config "treelet.$name.$key" "$value"
+    else
+        # Add new value
+        git config --add "treelet.$name.$key" "$value"
+    fi
+}
+
+# Validate config key
+# Usage: treelet_config_validate_key <key>
+treelet_config_validate_key() {
+    local key="$1"
+    case "$key" in
+        remote|remote-ref|path|last-sync|force-author-name|force-author-email)
+            return 0
+            ;;
+        *)
+            echo "Error: Invalid key '$key'. Valid keys: remote, remote-ref, path, last-sync, force-author-name, force-author-email"
+            return 1
+            ;;
+    esac
+}
+
+# Load treelet config from git config
+# Usage: load_treelet_config <name>
+# Sets global variables: REMOTE_URL, REMOTE_REF, TREELET_PATH, FORCE_AUTHOR_NAME, FORCE_AUTHOR_EMAIL
+load_treelet_config() {
+    local name="$1"
+
+    REMOTE_URL=$(treelet_config_get "$name" "remote")
+    REMOTE_REF=$(treelet_config_get "$name" "remote-ref")
+    TREELET_PATH=$(treelet_config_get "$name" "path")
+
+    # Load author settings if not already set via CLI
+    FORCE_AUTHOR_NAME=${FORCE_AUTHOR_NAME:-$(treelet_config_get "$name" "force-author-name")}
+    FORCE_AUTHOR_EMAIL=${FORCE_AUTHOR_EMAIL:-$(treelet_config_get "$name" "force-author-email")}
+
+    if [ -z "$REMOTE_URL" ] || [ -z "$REMOTE_REF" ] || [ -z "$TREELET_PATH" ]; then
+        echo "Error: Treelet '$name' is not configured properly."
+        echo "Missing: remote=$REMOTE_URL, remote-ref=$REMOTE_REF, path=$TREELET_PATH"
+        exit 1
+    fi
+}
+
+#############################################
+# Validation Helper Functions
+#############################################
+
+# Check if we're in a git repository
+# Usage: require_git_repo
+require_git_repo() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        echo "Error: Not a git repository."
+        exit 1
+    }
+}
+
+# Check that working tree is clean
+# Usage: require_clean_working_tree
+require_clean_working_tree() {
+    git diff --quiet && git diff --cached --quiet || {
+        echo "Error: Working tree has uncommitted changes."
+        echo "Commit or stash changes before running this command."
+        exit 1
+    }
+}
+
+# Validate that treelet path doesn't already exist (for add command)
+# Usage: require_path_not_exists <path>
+require_path_not_exists() {
+    local path="$1"
+    if [ -e "$path" ]; then
+        echo "Error: Path '$path' already exists."
+        exit 1
+    fi
+}
+
+# Validate that treelet is configured
+# Usage: require_treelet_configured <name>
+require_treelet_configured() {
+    local name="$1"
+    if ! git config --get-regexp "^treelet\.$name\." >/dev/null 2>&1; then
+        echo "Error: Treelet '$name' is not configured."
+        echo "Use 'git treelet add' to add an treelet first."
+        exit 1
+    fi
+}
+
+#############################################
+# Parse Commands
+#############################################
+if [[ $# -gt 0 && "$1" == "add" ]]; then
+    COMMAND="add"
+    shift
+elif [[ $# -gt 0 && "$1" == "push" ]]; then
+    COMMAND="push"
+    shift
+elif [[ $# -gt 0 && "$1" == "pull" ]]; then
+    COMMAND="pull"
+    shift
+elif [[ $# -gt 0 && "$1" == "sync" ]]; then
+    COMMAND="sync"
+    shift
+elif [[ $# -gt 0 && "$1" == "list" ]]; then
+    COMMAND="list"
+    shift
+elif [[ $# -gt 0 && "$1" == "config" ]]; then
+    COMMAND="config"
+    shift
+elif [[ $# -gt 0 && "$1" == "remove" ]]; then
+    COMMAND="remove"
+    shift
+elif [[ $# -gt 0 && "$1" != --* && "$1" != "-h" ]]; then
+    echo "Error: Unknown command '$1'."
+    echo "Use 'add', 'push', 'pull', 'sync', 'list', 'config', or 'remove'."
+    echo "Run 'git treelet -h' for usage."
+    exit 1
+fi
+
+#############################################
+# Parse Options
+#############################################
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --squash)
+            SQUASH=true
+            shift
+            ;;
+        --force-author-name=*)
+            FORCE_AUTHOR_NAME="${1#*=}"
+            shift
+            ;;
+        --force-author-email=*)
+            FORCE_AUTHOR_EMAIL="${1#*=}"
+            shift
+            ;;
+        -h)
+            cat <<'EOF'
+git treelet [COMMAND] [OPTIONS] [args...]
+
+Commands:
+  add <remote> <ref> <path> [treelet]  Add external repository as treelet
+  push <treelet>                       Push treelet changes to remote
+  pull <treelet>                       Pull remote changes into treelet
+  sync <treelet>                       Sync treelet (pull + push)
+  list                                List all configured treelets
+  config get <treelet> <key>           Get configuration value
+  config set <treelet> <key> <value>   Set configuration value
+  remove <treelet>                     Remove treelet configuration
+
+Options:
+  --verbose                        Show detailed logs
+  --squash                         Squash all changes into single commit (push only)
+  --force-author-name=<name>       Set author name for treelet commits
+  --force-author-email=<email>     Set author email for treelet commits
+  -h                               Show this help message
+
+Examples:
+  # Add external repo as treelet (name derived from path)
+  git treelet add https://github.com/user/repo.git main mylib
+
+  # Add with custom treelet name
+  git treelet add https://github.com/user/repo.git main path/to/mylib my-custom-name
+
+  # Add with custom author for treelet commits
+  git treelet add --force-author-name="Bot" --force-author-email="bot@example.com" \
+    https://github.com/user/repo.git main mylib
+
+  # Make changes and push
+  echo "test" >> mylib/file.txt
+  git add mylib/ && git commit -m "Update treelet"
+  git treelet push mylib
+
+  # Push with squash (single commit to remote)
+  git treelet push mylib --squash
+
+  # Pull changes from remote with custom author
+  git treelet pull mylib --force-author-name="Bot"
+
+  # Bidirectional sync
+  git treelet sync mylib
+
+  # List all treelets
+  git treelet list
+
+  # Get/set configuration values
+  git treelet config get mylib force-author-name
+  git treelet config set mylib force-author-email "bot@example.com"
+
+  # Remove treelet configuration (files remain)
+  git treelet remove mylib
+EOF
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            # Positional argument - order depends on command
+            if [ "$COMMAND" = "add" ]; then
+                # For add: <remote> <ref> <path> [treelet]
+                if [ -z "$REMOTE_URL" ]; then
+                    REMOTE_URL="$1"
+                elif [ -z "$REMOTE_REF" ]; then
+                    REMOTE_REF="$1"
+                elif [ -z "$TREELET_PATH" ]; then
+                    TREELET_PATH="$1"
+                elif [ -z "$TREELET_NAME" ]; then
+                    TREELET_NAME="$1"
+                fi
+            else
+                # For other commands: <treelet-name>
+                if [ -z "$TREELET_NAME" ]; then
+                    TREELET_NAME="$1"
+                fi
+            fi
+            shift
+            ;;
+    esac
+done
+
+#############################################
+# Show help if no command provided
+#############################################
+if [ -z "$COMMAND" ]; then
+    echo "Error: No command specified."
+    echo "Run 'git treelet -h' for usage."
+    exit 1
+fi
+
+#############################################
+# List Command
+#############################################
+if [ "$COMMAND" = "list" ]; then
+    require_git_repo
+
+    echo "Configured treelets:"
+    if ! git config --get-regexp '^treelet\.' >/dev/null 2>&1; then
+        echo "  (none)"
+        exit 0
+    fi
+
+    git config --get-regexp '^treelet\.' | sort | awk '{
+        # Extract treelet name and key
+        match($1, /^treelet\.([^.]+)\.([^.]+)$/, arr);
+        name = arr[1];
+        key = arr[2];
+        val = substr($0, index($0, " ") + 1);
+
+        if (name != "" && name != last_name) {
+            print name ":";
+            last_name = name;
+        }
+
+        if (key != "") {
+            print "  " key ": " val;
+        }
+    }'
+    exit 0
+fi
+
+#############################################
+# Config Command - Get or set configuration values
+#############################################
+if [ "$COMMAND" = "config" ]; then
+    require_git_repo
+
+    # Parse subcommand
+    if [ $# -eq 0 ]; then
+        cat <<'EOF'
+Usage: git treelet config <subcommand> [options]
+
+Subcommands:
+  get <treelet> <key>          Get a configuration value
+  set <treelet> <key> <value>  Set a configuration value
+
+Keys:
+  remote                 Remote repository URL
+  remote-ref             Remote branch/ref name
+  path                   Local subdirectory path
+  force-author-name      Author name for treelet commits
+  force-author-email     Author email for treelet commits
+  last-sync              Last sync commit SHA (read-only)
+
+Examples:
+  # Get the remote for an treelet
+  git treelet config get mylib remote
+
+  # Set author email for an treelet
+  git treelet config set mylib force-author-email "bot@example.com"
+
+  # Change remote URL
+  git treelet config set mylib remote https://github.com/user/newrepo.git
+EOF
+        exit 0
+    fi
+
+    SUBCOMMAND="$1"
+    shift
+
+    case "$SUBCOMMAND" in
+        get)
+            if [ $# -ne 2 ]; then
+                echo "Usage: git treelet config get <treelet> <key>"
+                exit 1
+            fi
+            TREELET_NAME="$1"
+            KEY="$2"
+
+            # Validate key
+            treelet_config_validate_key "$KEY" || exit 1
+
+            require_treelet_configured "$TREELET_NAME"
+
+            VALUE=$(treelet_config_get "$TREELET_NAME" "$KEY")
+            if [ -n "$VALUE" ]; then
+                echo "$VALUE"
+            else
+                echo "Error: No value set for treelet.$TREELET_NAME.$KEY"
+                exit 1
+            fi
+            exit 0
+            ;;
+        set)
+            if [ $# -ne 3 ]; then
+                echo "Usage: git treelet config set <treelet> <key> <value>"
+                exit 1
+            fi
+            TREELET_NAME="$1"
+            KEY="$2"
+            VALUE="$3"
+
+            # Validate key
+            treelet_config_validate_key "$KEY" || exit 1
+
+            require_treelet_configured "$TREELET_NAME"
+
+            treelet_config_set "$TREELET_NAME" "$KEY" "$VALUE"
+            echo "Set treelet.$TREELET_NAME.$KEY = $VALUE"
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown subcommand '$SUBCOMMAND'. Use 'get' or 'set'."
+            exit 1
+            ;;
+    esac
+fi
+
+#############################################
+# Remove Command
+#############################################
+if [ "$COMMAND" = "remove" ]; then
+    require_git_repo
+
+    if [ -z "$TREELET_NAME" ]; then
+        echo "Usage: git treelet remove <treelet>"
+        exit 1
+    fi
+
+    require_treelet_configured "$TREELET_NAME"
+
+    log "Removing treelet configuration for '$TREELET_NAME'..."
+
+    # Remove git config
+    git config --remove-section "treelet.$TREELET_NAME" 2>/dev/null || true
+
+    # Remove tracking refs
+    git update-ref -d "refs/treelet/$TREELET_NAME/remote" 2>/dev/null || true
+    git update-ref -d "refs/treelet/$TREELET_NAME/split" 2>/dev/null || true
+
+    echo "Treelet '$TREELET_NAME' removed from configuration."
+    echo "Note: Files in the treelet directory were NOT deleted."
+    exit 0
+fi
+
+#############################################
+# Add Command - Import external repo as treelet
+#############################################
+if [ "$COMMAND" = "add" ]; then
+    require_git_repo
+    require_clean_working_tree
+
+    # Validate arguments
+    if [ -z "$REMOTE_URL" ] || [ -z "$REMOTE_REF" ] || [ -z "$TREELET_PATH" ]; then
+        echo "Usage: git treelet add <remote> <ref> <path> [treelet]"
+        echo "Example: git treelet add https://github.com/user/repo.git main mylib"
+        echo "Example: git treelet add https://github.com/user/repo.git main path/to/lib my-custom-name"
+        exit 1
+    fi
+
+    # Generate treelet name from path (remove trailing slash, replace / with -)
+    if [ -z "$TREELET_NAME" ]; then
+        TREELET_NAME="${TREELET_PATH%/}"
+        TREELET_NAME="${TREELET_NAME//\//-}"
+    fi
+
+    # Validate path doesn't exist
+    require_path_not_exists "$TREELET_PATH"
+
+    # Check if treelet name already configured
+    if git config --get-regexp "^treelet\.$TREELET_NAME\." >/dev/null 2>&1; then
+        echo "Error: Treelet '$TREELET_NAME' is already configured."
+        exit 1
+    fi
+
+    log "Adding treelet '$TREELET_NAME' from $REMOTE_URL/$REMOTE_REF to $TREELET_PATH..."
+
+    # Fetch remote ref to temporary location
+    TEMP_REF="refs/treelet/$TREELET_NAME/temp"
+    log "Fetching remote..."
+    git fetch "$REMOTE_URL" "$REMOTE_REF:$TEMP_REF" 2>&1 | grep -v "^From" || true
+
+    REMOTE_COMMIT=$(git rev-parse "$TEMP_REF")
+    REMOTE_TREE_SHA=$(git rev-parse "$TEMP_REF^{tree}")
+    log "Remote tree SHA: $REMOTE_TREE_SHA"
+
+    # Build combined tree using temporary index
+    TEMP_INDEX=$(mktemp)
+    trap "rm -f '$TEMP_INDEX'" EXIT
+
+    export GIT_INDEX_FILE="$TEMP_INDEX"
+
+    CURRENT_HEAD=$(git rev-parse HEAD)
+    CURRENT_TREE=$(git rev-parse HEAD^{tree})
+
+    log "Building combined tree..."
+    # Read current HEAD tree
+    git read-tree "$CURRENT_TREE"
+
+    # Add remote tree under treelet prefix
+    git read-tree --prefix="$TREELET_PATH/" "$REMOTE_TREE_SHA"
+
+    # Write combined tree
+    NEW_TREE_SHA=$(git write-tree)
+    unset GIT_INDEX_FILE
+
+    log "Combined tree SHA: $NEW_TREE_SHA"
+
+    # Create commit
+    COMMIT_MESSAGE="Add treelet '$TREELET_PATH' from $REMOTE_URL/$REMOTE_REF
+
+Treelet-Add: $TREELET_NAME
+Treelet-Path: $TREELET_PATH
+Treelet-Remote: $REMOTE_URL
+Treelet-Ref: $REMOTE_REF
+Treelet-Commit: $REMOTE_COMMIT"
+
+    log "Creating commit..."
+    # Apply custom author if specified
+    if [ -n "$FORCE_AUTHOR_NAME" ] || [ -n "$FORCE_AUTHOR_EMAIL" ]; then
+        export GIT_AUTHOR_NAME="${FORCE_AUTHOR_NAME:-$(git config user.name)}"
+        export GIT_AUTHOR_EMAIL="${FORCE_AUTHOR_EMAIL:-$(git config user.email)}"
+        export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+        export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+        NEW_COMMIT=$(git commit-tree "$NEW_TREE_SHA" -p "$CURRENT_HEAD" -m "$COMMIT_MESSAGE")
+        unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    else
+        NEW_COMMIT=$(git commit-tree "$NEW_TREE_SHA" -p "$CURRENT_HEAD" -m "$COMMIT_MESSAGE")
+    fi
+
+    # Update current branch
+    CURRENT_BRANCH=$(git symbolic-ref --short HEAD)
+    log "Updating $CURRENT_BRANCH..."
+    git update-ref "refs/heads/$CURRENT_BRANCH" "$NEW_COMMIT"
+
+    # Update working tree
+    log "Updating working tree..."
+    git reset --hard HEAD 2>&1 | grep -v "^HEAD is now at" || true
+
+    # Store configuration
+    log "Saving configuration..."
+    treelet_config_set "$TREELET_NAME" "path" "$TREELET_PATH"
+    treelet_config_set "$TREELET_NAME" "remote" "$REMOTE_URL"
+    treelet_config_set "$TREELET_NAME" "remote-ref" "$REMOTE_REF"
+    treelet_config_set "$TREELET_NAME" "last-sync" "$NEW_COMMIT"
+
+    # Save author settings if provided
+    if [ -n "$FORCE_AUTHOR_NAME" ]; then
+        treelet_config_set "$TREELET_NAME" "force-author-name" "$FORCE_AUTHOR_NAME"
+        log "  Saved force-author-name: $FORCE_AUTHOR_NAME"
+    fi
+    if [ -n "$FORCE_AUTHOR_EMAIL" ]; then
+        treelet_config_set "$TREELET_NAME" "force-author-email" "$FORCE_AUTHOR_EMAIL"
+        log "  Saved force-author-email: $FORCE_AUTHOR_EMAIL"
+    fi
+
+    # Create tracking ref
+    git update-ref "refs/treelet/$TREELET_NAME/remote" "$REMOTE_COMMIT"
+
+    echo "Treelet '$TREELET_NAME' added successfully at $TREELET_PATH (${NEW_COMMIT:0:8})"
+    exit 0
+fi
+
+#############################################
+# Pull Command - Sync treelet from remote
+#############################################
+if [ "$COMMAND" = "pull" ]; then
+    require_git_repo
+    require_clean_working_tree
+
+    # Validate arguments
+    if [ -z "$TREELET_NAME" ]; then
+        echo "Usage: git treelet pull <treelet> [--verbose]"
+        exit 1
+    fi
+
+    require_treelet_configured "$TREELET_NAME"
+    load_treelet_config "$TREELET_NAME"
+
+    log "Pulling treelet '$TREELET_NAME' from $REMOTE_URL/$REMOTE_REF..."
+
+    # Fetch remote ref
+    TEMP_REF="refs/treelet/$TREELET_NAME/temp"
+    log "Fetching remote..."
+    git fetch "$REMOTE_URL" "$REMOTE_REF:$TEMP_REF" 2>&1 | grep -v "^From" || true
+
+    REMOTE_COMMIT=$(git rev-parse "$TEMP_REF")
+    REMOTE_TREE_SHA=$(git rev-parse "$TEMP_REF^{tree}")
+    log "Remote tree SHA: $REMOTE_TREE_SHA"
+
+    # Check if remote has changed since last sync
+    if git rev-parse --verify "refs/treelet/$TREELET_NAME/remote" >/dev/null 2>&1; then
+        LAST_REMOTE_COMMIT=$(git rev-parse "refs/treelet/$TREELET_NAME/remote")
+        if [ "$REMOTE_COMMIT" = "$LAST_REMOTE_COMMIT" ]; then
+            echo "Treelet '$TREELET_NAME' is already up to date."
+            exit 0
+        fi
+    fi
+
+    # Build combined tree using temporary index
+    TEMP_INDEX=$(mktemp)
+    trap "rm -f '$TEMP_INDEX'" EXIT
+
+    export GIT_INDEX_FILE="$TEMP_INDEX"
+
+    CURRENT_HEAD=$(git rev-parse HEAD)
+    CURRENT_TREE=$(git rev-parse HEAD^{tree})
+
+    log "Building combined tree..."
+    # Read current HEAD tree
+    git read-tree "$CURRENT_TREE"
+
+    # Remove existing treelet path (to replace it)
+    git rm --cached -r "$TREELET_PATH/" >/dev/null 2>&1 || true
+
+    # Add remote tree under treelet prefix
+    git read-tree --prefix="$TREELET_PATH/" "$REMOTE_TREE_SHA"
+
+    # Write combined tree
+    NEW_TREE_SHA=$(git write-tree)
+    unset GIT_INDEX_FILE
+
+    log "Combined tree SHA: $NEW_TREE_SHA"
+
+    # Create commit
+    COMMIT_MESSAGE="Sync treelet '$TREELET_PATH' from $REMOTE_URL/$REMOTE_REF
+
+Treelet-Sync: $TREELET_NAME
+Treelet-Path: $TREELET_PATH
+Treelet-Remote: $REMOTE_URL
+Treelet-Ref: $REMOTE_REF
+Treelet-Commit: $REMOTE_COMMIT"
+
+    log "Creating commit..."
+    # Apply custom author if specified
+    if [ -n "$FORCE_AUTHOR_NAME" ] || [ -n "$FORCE_AUTHOR_EMAIL" ]; then
+        export GIT_AUTHOR_NAME="${FORCE_AUTHOR_NAME:-$(git config user.name)}"
+        export GIT_AUTHOR_EMAIL="${FORCE_AUTHOR_EMAIL:-$(git config user.email)}"
+        export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+        export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+        NEW_COMMIT=$(git commit-tree "$NEW_TREE_SHA" -p "$CURRENT_HEAD" -m "$COMMIT_MESSAGE")
+        unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+    else
+        NEW_COMMIT=$(git commit-tree "$NEW_TREE_SHA" -p "$CURRENT_HEAD" -m "$COMMIT_MESSAGE")
+    fi
+
+    # Update current branch
+    CURRENT_BRANCH=$(git symbolic-ref --short HEAD)
+    log "Updating $CURRENT_BRANCH..."
+    git update-ref "refs/heads/$CURRENT_BRANCH" "$NEW_COMMIT"
+
+    # Update working tree
+    log "Updating working tree..."
+    git reset --hard HEAD 2>&1 | grep -v "^HEAD is now at" || true
+
+    # Update tracking
+    log "Updating tracking refs..."
+    git update-ref "refs/treelet/$TREELET_NAME/remote" "$REMOTE_COMMIT"
+    treelet_config_set "$TREELET_NAME" "last-sync" "$NEW_COMMIT"
+
+    echo "Treelet '$TREELET_NAME' synced from remote (${NEW_COMMIT:0:8})"
+    exit 0
+fi
+
+#############################################
+# Push Command - Extract and push treelet changes
+#############################################
+if [ "$COMMAND" = "push" ]; then
+    require_git_repo
+    require_clean_working_tree
+
+    # Check for git-filter-repo
+    command -v git-filter-repo >/dev/null 2>&1 || {
+        echo "Error: git-filter-repo not installed."
+        echo "Install it with: pip install git-filter-repo"
+        exit 1
+    }
+
+    # Validate arguments
+    if [ -z "$TREELET_NAME" ]; then
+        echo "Usage: git treelet push <treelet> [--verbose]"
+        exit 1
+    fi
+
+    require_treelet_configured "$TREELET_NAME"
+    load_treelet_config "$TREELET_NAME"
+
+    log "Pushing treelet '$TREELET_NAME' to $REMOTE_URL/$REMOTE_REF..."
+
+    # Check if there are any local changes to push
+    LAST_SYNC=$(treelet_config_get "$TREELET_NAME" "last-sync")
+    if [ -n "$LAST_SYNC" ]; then
+        # Check if treelet path has changed since last sync
+        if git diff --quiet "$LAST_SYNC" HEAD -- "$TREELET_PATH/"; then
+            echo "No changes to push in treelet '$TREELET_NAME'."
+            exit 0
+        fi
+    fi
+
+    # Create temporary clone and filter
+    TEMP_CLONE=$(mktemp -d)
+    ORIGINAL_REPO=$(git rev-parse --show-toplevel)
+    trap "rm -rf '$TEMP_CLONE'" EXIT
+
+    log "Creating temporary clone for filtering..."
+    git clone --no-hardlinks "$ORIGINAL_REPO" "$TEMP_CLONE" 2>&1 | grep -v "^Cloning\|^done\." || true
+
+    # Filter to only include treelet path
+    log "Filtering history to extract $TREELET_PATH..."
+    git -C "$TEMP_CLONE" filter-repo \
+        --path "$TREELET_PATH/" \
+        --path-rename "$TREELET_PATH/:" \
+        --force --quiet 2>&1 | grep -v "^Parsed\|^New history\|^Completely\|^NOTICE\|^  " || true
+
+    # Push filtered history back to original repo as split ref
+    log "Creating split ref..."
+    git -C "$TEMP_CLONE" push -f "$ORIGINAL_REPO" HEAD:"refs/treelet/$TREELET_NAME/split" 2>&1 | grep -v "^To\|^remote:" || true
+
+    # Cleanup temp clone
+    rm -rf "$TEMP_CLONE"
+
+    # Filter out Treelet-Sync and Treelet-Add commits (they're just metadata, not real changes)
+    log "Filtering out sync/add commits..."
+    if git rev-parse --verify "refs/treelet/$TREELET_NAME/remote" >/dev/null 2>&1; then
+        BASE_PARENT="refs/treelet/$TREELET_NAME/remote"
+        COMMITS_TO_FILTER=$(git rev-list --reverse "$BASE_PARENT..refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+    else
+        # First push - filter all commits
+        BASE_PARENT=""
+        COMMITS_TO_FILTER=$(git rev-list --reverse "refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+    fi
+
+    if [ -n "$COMMITS_TO_FILTER" ]; then
+        CURRENT_PARENT="$BASE_PARENT"
+        FILTERED_ANY=false
+
+        for commit in $COMMITS_TO_FILTER; do
+            # Check if this is a sync or add commit
+            COMMIT_BODY=$(git log -1 --format='%B' "$commit")
+            if echo "$COMMIT_BODY" | grep -qE "^Treelet-(Sync|Add): $TREELET_NAME$"; then
+                log "  Skipping sync/add commit $(git log -1 --format='%h' "$commit")"
+                FILTERED_ANY=true
+                continue
+            fi
+
+            # Not a sync/add commit - recreate it with current parent
+            TREE=$(git rev-parse "$commit^{tree}")
+            AUTHOR_NAME=$(git log -1 --format='%an' "$commit")
+            AUTHOR_EMAIL=$(git log -1 --format='%ae' "$commit")
+            AUTHOR_DATE=$(git log -1 --format='%aI' "$commit")
+            COMMITTER_NAME=$(git log -1 --format='%cn' "$commit")
+            COMMITTER_EMAIL=$(git log -1 --format='%ce' "$commit")
+            COMMITTER_DATE=$(git log -1 --format='%cI' "$commit")
+            MESSAGE=$(git log -1 --format='%B' "$commit")
+
+            if [ -z "$CURRENT_PARENT" ]; then
+                NEW_COMMIT=$(GIT_AUTHOR_NAME="$AUTHOR_NAME" \
+                             GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" \
+                             GIT_AUTHOR_DATE="$AUTHOR_DATE" \
+                             GIT_COMMITTER_NAME="$COMMITTER_NAME" \
+                             GIT_COMMITTER_EMAIL="$COMMITTER_EMAIL" \
+                             GIT_COMMITTER_DATE="$COMMITTER_DATE" \
+                             git commit-tree "$TREE" -m "$MESSAGE")
+            else
+                NEW_COMMIT=$(GIT_AUTHOR_NAME="$AUTHOR_NAME" \
+                             GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" \
+                             GIT_AUTHOR_DATE="$AUTHOR_DATE" \
+                             GIT_COMMITTER_NAME="$COMMITTER_NAME" \
+                             GIT_COMMITTER_EMAIL="$COMMITTER_EMAIL" \
+                             GIT_COMMITTER_DATE="$COMMITTER_DATE" \
+                             git commit-tree "$TREE" -p "$CURRENT_PARENT" -m "$MESSAGE")
+            fi
+            CURRENT_PARENT="$NEW_COMMIT"
+        done
+
+        # Update split ref if we filtered anything
+        if [ "$FILTERED_ANY" = true ]; then
+            if [ -n "$CURRENT_PARENT" ]; then
+                git update-ref "refs/treelet/$TREELET_NAME/split" "$CURRENT_PARENT"
+                log "  Filtered out sync/add commits"
+            else
+                # All commits were sync/add commits - nothing to push
+                echo "No changes to push (only sync/add commits found)."
+                exit 0
+            fi
+        fi
+    fi
+
+    # Squash commits if requested
+    if [ "$SQUASH" = true ]; then
+        log "Squashing commits into single commit..."
+
+        # Get base parent for squashed commit
+        if git rev-parse --verify "refs/treelet/$TREELET_NAME/remote" >/dev/null 2>&1; then
+            BASE_PARENT="refs/treelet/$TREELET_NAME/remote"
+            COMMITS_TO_SQUASH=$(git rev-list --reverse "$BASE_PARENT..refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+        else
+            # First push - squash all commits
+            BASE_PARENT=""
+            COMMITS_TO_SQUASH=$(git rev-list --reverse "refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+        fi
+
+        if [ -n "$COMMITS_TO_SQUASH" ]; then
+            # Get final tree
+            FINAL_TREE=$(git rev-parse "refs/treelet/$TREELET_NAME/split^{tree}")
+
+            # Collect all commit messages
+            SQUASH_MESSAGE="Squashed treelet changes for '$TREELET_NAME'
+
+Combined commits:"
+            for commit in $COMMITS_TO_SQUASH; do
+                COMMIT_MSG=$(git log -1 --format='%s' "$commit")
+                COMMIT_SHA_SHORT=$(git log -1 --format='%h' "$commit")
+                SQUASH_MESSAGE="$SQUASH_MESSAGE
+- $COMMIT_SHA_SHORT: $COMMIT_MSG"
+            done
+
+            # Create squashed commit
+            if [ -z "$BASE_PARENT" ]; then
+                SQUASHED_COMMIT=$(git commit-tree "$FINAL_TREE" -m "$SQUASH_MESSAGE")
+            else
+                SQUASHED_COMMIT=$(git commit-tree "$FINAL_TREE" -p "$BASE_PARENT" -m "$SQUASH_MESSAGE")
+            fi
+
+            # Update split ref to point to squashed commit
+            git update-ref "refs/treelet/$TREELET_NAME/split" "$SQUASHED_COMMIT"
+            log "Squashed $(echo "$COMMITS_TO_SQUASH" | wc -w) commit(s) into one"
+        fi
+    fi
+
+    # Rewrite author info if specified
+    if [ -n "$FORCE_AUTHOR_NAME" ] || [ -n "$FORCE_AUTHOR_EMAIL" ]; then
+        log "Rewriting author info for pushed commits..."
+
+        # Get list of commits to push
+        if git rev-parse --verify "refs/treelet/$TREELET_NAME/remote" >/dev/null 2>&1; then
+            COMMITS_TO_REWRITE=$(git rev-list --reverse "refs/treelet/$TREELET_NAME/remote..refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+            BASE_PARENT="refs/treelet/$TREELET_NAME/remote"
+        else
+            # First push - rewrite all commits
+            COMMITS_TO_REWRITE=$(git rev-list --reverse "refs/treelet/$TREELET_NAME/split" 2>/dev/null || echo "")
+            BASE_PARENT=""
+        fi
+
+        if [ -n "$COMMITS_TO_REWRITE" ]; then
+            CURRENT_PARENT="$BASE_PARENT"
+            TARGET_AUTHOR_NAME="${FORCE_AUTHOR_NAME:-$(git config user.name)}"
+            TARGET_AUTHOR_EMAIL="${FORCE_AUTHOR_EMAIL:-$(git config user.email)}"
+
+            for commit in $COMMITS_TO_REWRITE; do
+                TREE=$(git rev-parse "$commit^{tree}")
+                AUTHOR_DATE=$(git log -1 --format='%aI' "$commit")
+                COMMITTER_DATE=$(git log -1 --format='%cI' "$commit")
+                MESSAGE=$(git log -1 --format='%B' "$commit")
+
+                if [ -z "$CURRENT_PARENT" ]; then
+                    NEW_COMMIT=$(GIT_AUTHOR_NAME="$TARGET_AUTHOR_NAME" \
+                                 GIT_AUTHOR_EMAIL="$TARGET_AUTHOR_EMAIL" \
+                                 GIT_AUTHOR_DATE="$AUTHOR_DATE" \
+                                 GIT_COMMITTER_NAME="$TARGET_AUTHOR_NAME" \
+                                 GIT_COMMITTER_EMAIL="$TARGET_AUTHOR_EMAIL" \
+                                 GIT_COMMITTER_DATE="$COMMITTER_DATE" \
+                                 git commit-tree "$TREE" -m "$MESSAGE")
+                else
+                    NEW_COMMIT=$(GIT_AUTHOR_NAME="$TARGET_AUTHOR_NAME" \
+                                 GIT_AUTHOR_EMAIL="$TARGET_AUTHOR_EMAIL" \
+                                 GIT_AUTHOR_DATE="$AUTHOR_DATE" \
+                                 GIT_COMMITTER_NAME="$TARGET_AUTHOR_NAME" \
+                                 GIT_COMMITTER_EMAIL="$TARGET_AUTHOR_EMAIL" \
+                                 GIT_COMMITTER_DATE="$COMMITTER_DATE" \
+                                 git commit-tree "$TREE" -p "$CURRENT_PARENT" -m "$MESSAGE")
+                fi
+                CURRENT_PARENT="$NEW_COMMIT"
+            done
+
+            # Update split ref with rewritten history
+            git update-ref "refs/treelet/$TREELET_NAME/split" "$CURRENT_PARENT"
+            log "Rewrote $(echo "$COMMITS_TO_REWRITE" | wc -w) commit(s)"
+        fi
+    fi
+
+    # Push split ref to remote
+    log "Pushing to $REMOTE_URL/$REMOTE_REF..."
+    git push "$REMOTE_URL" "refs/treelet/$TREELET_NAME/split:$REMOTE_REF" 2>&1 | grep -v "^remote:" || true
+
+    # Fetch back to update tracking
+    TEMP_REF="refs/treelet/$TREELET_NAME/temp"
+    git fetch "$REMOTE_URL" "$REMOTE_REF:$TEMP_REF" 2>&1 | grep -v "^From" || true
+
+    REMOTE_COMMIT=$(git rev-parse "$TEMP_REF")
+    git update-ref "refs/treelet/$TREELET_NAME/remote" "$REMOTE_COMMIT"
+
+    # Update last-sync to current HEAD
+    CURRENT_HEAD=$(git rev-parse HEAD)
+    treelet_config_set "$TREELET_NAME" "last-sync" "$CURRENT_HEAD"
+
+    echo "Treelet '$TREELET_NAME' pushed to remote (${REMOTE_COMMIT:0:8})"
+    exit 0
+fi
+
+#############################################
+# Sync Command - Pull then Push
+#############################################
+if [ "$COMMAND" = "sync" ]; then
+    require_git_repo
+
+    # Validate arguments
+    if [ -z "$TREELET_NAME" ]; then
+        echo "Usage: git treelet sync <treelet> [--verbose]"
+        exit 1
+    fi
+
+    require_treelet_configured "$TREELET_NAME"
+
+    log "Syncing treelet '$TREELET_NAME'..."
+
+    # Execute pull
+    log "Step 1: Pulling changes from remote..."
+    "$0" pull "$TREELET_NAME" ${VERBOSE:+--verbose} || {
+        echo "Error: Pull failed."
+        exit 1
+    }
+
+    # Execute push
+    log "Step 2: Pushing changes to remote..."
+    "$0" push "$TREELET_NAME" ${VERBOSE:+--verbose} || {
+        echo "Error: Push failed."
+        exit 1
+    }
+
+    echo "Treelet '$TREELET_NAME' synced successfully."
+    exit 0
+fi
+
+echo "Error: Command '$COMMAND' not implemented."
+exit 1
