@@ -34,6 +34,8 @@ Think of it as an enhanced `git subtree` that:
    git treelet add https://github.com/user/lib.git main mylib
    ```
 
+   **Note:** You can also invoke it directly as `git-treelet` if needed, but using the git subcommand form (`git treelet`) is recommended.
+
 ## Quick Start
 
 ```bash
@@ -218,3 +220,7 @@ Stored in git config as `treelet.<name>.*` keys, plus refs under `refs/treelet/<
 ## Development
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for development guidelines and testing information.
+
+## License
+
+See [LICENSE](LICENSE) for license information.
