@@ -10,6 +10,7 @@ Think of it as an enhanced `git subtree` that:
 - Allows custom naming for treelets (independent of path)
 - Supports author rewriting for privacy
 - Works without touching your working tree during operations
+- Can be run from any subdirectory (like standard git commands)
 
 **Use case:** You have a monorepo and want to maintain some subdirectories as independent git repositories that can be developed both in the monorepo and standalone.
 
@@ -84,6 +85,8 @@ git treelet list
 # Remove treelet configuration (files remain)
 git treelet remove mylib
 ```
+
+**Note:** All commands work from any subdirectory within your repository, just like standard git commands. You can run `git treelet push mylib` from within the `mylib/` directory or any other directory in your repository.
 
 ## Commands
 

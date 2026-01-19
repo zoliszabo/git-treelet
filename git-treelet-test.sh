@@ -221,6 +221,64 @@ test_treelet_remove() {
     cd ..
 }
 
+test_treelet_subdirectory() {
+    test_start "Commands work from subdirectories"
+
+    # Create remote repo
+    init_test_repo "remote-subdir"
+    cd remote-subdir
+    git config receive.denyCurrentBranch updateInstead
+    echo "content" > file.txt
+    git add file.txt
+    git commit -q -m "Add content"
+    REMOTE_URL=$(pwd)
+    REMOTE_BRANCH=$(git symbolic-ref --short HEAD)
+    cd ..
+
+    # Create parent repo
+    init_test_repo "parent-subdir"
+    cd parent-subdir
+
+    # Create a subdirectory
+    mkdir -p some/nested/dir
+    echo "other content" > some/nested/dir/file.txt
+    git add some/nested/dir/file.txt
+    git commit -q -m "Add nested content"
+
+    # Try to add treelet from subdirectory
+    cd some/nested/dir
+    if "$SCRIPT" add "$REMOTE_URL" "$REMOTE_BRANCH" sublib > /dev/null 2>&1; then
+        # Go back to root to verify
+        cd ../../..
+        if [ -d "sublib" ] && [ -f "sublib/file.txt" ]; then
+            # Now test other commands from subdirectory
+            cd some/nested/dir
+
+            # Test list command
+            if "$SCRIPT" list > /dev/null 2>&1; then
+                # Test pull command (should say up-to-date)
+                if "$SCRIPT" pull sublib > /dev/null 2>&1; then
+                    cd ../../..
+                    pass "Commands work from subdirectories"
+                else
+                    cd ../../..
+                    fail "Subdirectory test" "Pull failed from subdirectory"
+                fi
+            else
+                cd ../../..
+                fail "Subdirectory test" "List failed from subdirectory"
+            fi
+        else
+            fail "Subdirectory test" "Treelet not added correctly from subdirectory"
+        fi
+    else
+        cd ../../..
+        fail "Subdirectory test" "Add failed from subdirectory"
+    fi
+
+    cd ..
+}
+
 #############################################
 # Run all tests
 #############################################
@@ -246,6 +304,7 @@ main() {
     test_treelet_pull
     test_treelet_push
     test_treelet_remove
+    test_treelet_subdirectory
 
     # Cleanup
     cd "$(dirname "$TEST_DIR")"

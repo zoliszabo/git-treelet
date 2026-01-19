@@ -13,6 +13,7 @@ REMOTE_REF=""
 FORCE_AUTHOR_NAME=""
 FORCE_AUTHOR_EMAIL=""
 SQUASH=false
+GIT_ROOT=""  # Will be set by require_git_repo
 
 # Logging function
 log() { $VERBOSE && echo "$1" || true; }
@@ -86,11 +87,21 @@ load_treelet_config() {
 # Validation Helper Functions
 #############################################
 
-# Check if we're in a git repository
+# Check if we're in a git repository, change to repo root, and set GIT_ROOT
 # Usage: require_git_repo
+# Changes to the repository root directory and sets global variable GIT_ROOT
+# This ensures git-treelet works from any subdirectory (just like git commands)
+# Note: This only affects the script's working directory, not the user's shell
 require_git_repo() {
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
         echo "Error: Not a git repository."
+        exit 1
+    }
+
+    # Store repository root and change to it
+    GIT_ROOT=$(git rev-parse --show-toplevel)
+    cd "$GIT_ROOT" || {
+        echo "Error: Could not change to repository root: $GIT_ROOT"
         exit 1
     }
 }
@@ -109,7 +120,9 @@ require_clean_working_tree() {
 # Usage: require_path_not_exists <path>
 require_path_not_exists() {
     local path="$1"
-    if [ -e "$path" ]; then
+    # Use absolute path from repository root
+    local abs_path="$GIT_ROOT/$path"
+    if [ -e "$abs_path" ]; then
         echo "Error: Path '$path' already exists."
         exit 1
     fi
