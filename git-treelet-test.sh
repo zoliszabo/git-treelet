@@ -279,6 +279,59 @@ test_treelet_subdirectory() {
     cd ..
 }
 
+test_treelet_autodetect() {
+    test_start "Auto-detect treelet name from current directory"
+
+    # Create remote repo
+    init_test_repo "remote-autodetect"
+    cd remote-autodetect
+    git config receive.denyCurrentBranch updateInstead
+    echo "content" > file.txt
+    git add file.txt
+    git commit -q -m "Add content"
+    REMOTE_URL=$(pwd)
+    REMOTE_BRANCH=$(git symbolic-ref --short HEAD)
+    cd ..
+
+    # Create parent repo
+    init_test_repo "parent-autodetect"
+    cd parent-autodetect
+
+    # Add treelet from repo root
+    "$SCRIPT" add "$REMOTE_URL" "$REMOTE_BRANCH" mylib > /dev/null 2>&1
+
+    # Test push without specifying treelet name from within treelet directory
+    echo "change" >> mylib/file.txt
+    git add mylib && git commit -q -m "Update"
+
+    cd mylib
+    if "$SCRIPT" push > /dev/null 2>&1; then
+        # Test pull without specifying treelet name
+        cd ..
+        cd mylib
+        if "$SCRIPT" pull > /dev/null 2>&1; then
+            # Test from nested subdirectory within treelet
+            mkdir -p subdir
+            cd subdir
+            if "$SCRIPT" list > /dev/null 2>&1; then
+                cd ../..
+                pass "Auto-detect works from treelet directory and subdirectories"
+            else
+                cd ../..
+                fail "Auto-detect test" "List failed from nested subdirectory"
+            fi
+        else
+            cd ..
+            fail "Auto-detect test" "Pull failed with auto-detection"
+        fi
+    else
+        cd ..
+        fail "Auto-detect test" "Push failed with auto-detection"
+    fi
+
+    cd ..
+}
+
 #############################################
 # Run all tests
 #############################################
@@ -305,6 +358,7 @@ main() {
     test_treelet_push
     test_treelet_remove
     test_treelet_subdirectory
+    test_treelet_autodetect
 
     # Cleanup
     cd "$(dirname "$TEST_DIR")"

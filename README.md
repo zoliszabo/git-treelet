@@ -11,6 +11,7 @@ Think of it as an enhanced `git subtree` that:
 - Supports author rewriting for privacy
 - Works without touching your working tree during operations
 - Can be run from any subdirectory (like standard git commands)
+- Auto-detects treelet name when run from within treelet directories
 
 **Use case:** You have a monorepo and want to maintain some subdirectories as independent git repositories that can be developed both in the monorepo and standalone.
 
@@ -86,7 +87,19 @@ git treelet list
 git treelet remove mylib
 ```
 
-**Note:** All commands work from any subdirectory within your repository, just like standard git commands. You can run `git treelet push mylib` from within the `mylib/` directory or any other directory in your repository.
+**Note:** All commands work from any subdirectory within your repository, just like standard git commands. Additionally, when you're inside a treelet directory (or any of its subdirectories), you can omit the treelet name - it will be auto-detected:
+
+```bash
+# From repo root - treelet name required
+git treelet push mylib
+
+# From within mylib/ or mylib/src/ - auto-detected
+cd mylib
+git treelet push     # Automatically detects 'mylib'
+
+cd src/components
+git treelet pull     # Still works from nested directories
+```
 
 ## Commands
 
@@ -118,13 +131,16 @@ The treelet name is used for git config keys (`treelet.<name>.*`). If not specif
 Push local changes to the treelet's remote repository:
 
 ```bash
-git treelet push <treelet> [--verbose] [--squash]
+git treelet push [treelet] [--verbose] [--squash]
 ```
 
 Examples:
 ```bash
-# Push changes
+# Push changes (explicit name)
 git treelet push mylib
+
+# Push from within treelet directory (auto-detect)
+cd mylib && git treelet push
 
 # Push with all commits squashed into one
 git treelet push mylib --squash
@@ -133,34 +149,52 @@ git treelet push mylib --squash
 git treelet push --force-author-name="Bot" mylib
 ```
 
-**Note:** Sync/add metadata commits are automatically filtered out.
+**Note:**
+- Sync/add metadata commits are automatically filtered out
+- If run from within a treelet directory, the treelet name can be omitted and will be auto-detected
 
 ### pull
 
 Pull changes from the treelet's remote repository:
 
 ```bash
-git treelet pull <treelet> [--verbose]
+git treelet pull [treelet] [--verbose]
 ```
 
 Examples:
 ```bash
-# Pull changes
+# Pull changes (explicit name)
 git treelet pull mylib
+
+# Pull from within treelet directory (auto-detect)
+cd mylib && git treelet pull
 
 # Pull with custom author for the sync commit
 git treelet pull --force-author-name="Bot" mylib
 ```
 
-Skips pulling if remote hasn't changed.
+**Note:**
+- Skips pulling if remote hasn't changed
+- If run from within a treelet directory, the treelet name can be omitted and will be auto-detected
 
 ### sync
 
 Bidirectional sync (pull then push):
 
 ```bash
-git treelet sync <treelet> [--verbose]
+git treelet sync [treelet] [--verbose]
 ```
+
+Examples:
+```bash
+# Sync (explicit name)
+git treelet sync mylib
+
+# Sync from within treelet directory (auto-detect)
+cd mylib && git treelet sync
+```
+
+**Note:** If run from within a treelet directory, the treelet name can be omitted and will be auto-detected
 
 ### list
 

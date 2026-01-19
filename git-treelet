@@ -14,6 +14,7 @@ FORCE_AUTHOR_NAME=""
 FORCE_AUTHOR_EMAIL=""
 SQUASH=false
 GIT_ROOT=""  # Will be set by require_git_repo
+ORIGINAL_DIR=""  # Original working directory before cd to repo root
 
 # Logging function
 log() { $VERBOSE && echo "$1" || true; }
@@ -89,7 +90,7 @@ load_treelet_config() {
 
 # Check if we're in a git repository, change to repo root, and set GIT_ROOT
 # Usage: require_git_repo
-# Changes to the repository root directory and sets global variable GIT_ROOT
+# Changes to the repository root directory and sets global variables GIT_ROOT and ORIGINAL_DIR
 # This ensures git-treelet works from any subdirectory (just like git commands)
 # Note: This only affects the script's working directory, not the user's shell
 require_git_repo() {
@@ -98,8 +99,11 @@ require_git_repo() {
         exit 1
     }
 
-    # Store repository root and change to it
+    # Store original directory and repository root
+    ORIGINAL_DIR=$(pwd)
     GIT_ROOT=$(git rev-parse --show-toplevel)
+
+    # Change to repository root
     cd "$GIT_ROOT" || {
         echo "Error: Could not change to repository root: $GIT_ROOT"
         exit 1
@@ -137,6 +141,43 @@ require_treelet_configured() {
         echo "Use 'git treelet add' to add an treelet first."
         exit 1
     fi
+}
+
+# Auto-detect treelet name from current directory
+# Usage: auto_detect_treelet_name
+# Sets global variable TREELET_NAME if detection succeeds
+# Returns 0 on success, 1 on failure
+auto_detect_treelet_name() {
+    # Calculate relative path from repo root to original directory
+    local rel_path="${ORIGINAL_DIR#$GIT_ROOT}"
+    rel_path="${rel_path#/}"  # Remove leading slash if present
+
+    # If we're at repo root, can't auto-detect
+    if [ -z "$rel_path" ]; then
+        return 1
+    fi
+
+    # Get all configured treelets and their paths
+    local treelet_configs=$(git config --get-regexp "^treelet\..*\.path$" 2>/dev/null || echo "")
+
+    if [ -z "$treelet_configs" ]; then
+        return 1
+    fi
+
+    # Check if current path is within any treelet path
+    while IFS= read -r line; do
+        local config_key=$(echo "$line" | cut -d' ' -f1)
+        local treelet_path=$(echo "$line" | cut -d' ' -f2-)
+        local name=$(echo "$config_key" | sed 's/^treelet\.\(.*\)\.path$/\1/')
+
+        # Check if current directory is the treelet path or a subdirectory of it
+        if [ "$rel_path" = "$treelet_path" ] || [[ "$rel_path" == "$treelet_path/"* ]]; then
+            TREELET_NAME="$name"
+            return 0
+        fi
+    done <<< "$treelet_configs"
+
+    return 1
 }
 
 #############################################
@@ -410,9 +451,14 @@ fi
 if [ "$COMMAND" = "remove" ]; then
     require_git_repo
 
+    # Auto-detect treelet name if not provided
     if [ -z "$TREELET_NAME" ]; then
-        echo "Usage: git treelet remove <treelet>"
-        exit 1
+        if ! auto_detect_treelet_name; then
+            echo "Usage: git treelet remove <treelet>"
+            echo "Or run from within a treelet directory to auto-detect."
+            exit 1
+        fi
+        log "Auto-detected treelet: $TREELET_NAME"
     fi
 
     require_treelet_configured "$TREELET_NAME"
@@ -556,10 +602,14 @@ if [ "$COMMAND" = "pull" ]; then
     require_git_repo
     require_clean_working_tree
 
-    # Validate arguments
+    # Auto-detect treelet name if not provided
     if [ -z "$TREELET_NAME" ]; then
-        echo "Usage: git treelet pull <treelet> [--verbose]"
-        exit 1
+        if ! auto_detect_treelet_name; then
+            echo "Usage: git treelet pull <treelet> [--verbose]"
+            echo "Or run from within a treelet directory to auto-detect."
+            exit 1
+        fi
+        log "Auto-detected treelet: $TREELET_NAME"
     fi
 
     require_treelet_configured "$TREELET_NAME"
@@ -664,10 +714,14 @@ if [ "$COMMAND" = "push" ]; then
         exit 1
     }
 
-    # Validate arguments
+    # Auto-detect treelet name if not provided
     if [ -z "$TREELET_NAME" ]; then
-        echo "Usage: git treelet push <treelet> [--verbose]"
-        exit 1
+        if ! auto_detect_treelet_name; then
+            echo "Usage: git treelet push <treelet> [--verbose]"
+            echo "Or run from within a treelet directory to auto-detect."
+            exit 1
+        fi
+        log "Auto-detected treelet: $TREELET_NAME"
     fi
 
     require_treelet_configured "$TREELET_NAME"
@@ -892,10 +946,14 @@ fi
 if [ "$COMMAND" = "sync" ]; then
     require_git_repo
 
-    # Validate arguments
+    # Auto-detect treelet name if not provided
     if [ -z "$TREELET_NAME" ]; then
-        echo "Usage: git treelet sync <treelet> [--verbose]"
-        exit 1
+        if ! auto_detect_treelet_name; then
+            echo "Usage: git treelet sync <treelet> [--verbose]"
+            echo "Or run from within a treelet directory to auto-detect."
+            exit 1
+        fi
+        log "Auto-detected treelet: $TREELET_NAME"
     fi
 
     require_treelet_configured "$TREELET_NAME"
